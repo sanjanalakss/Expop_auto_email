@@ -118,8 +118,12 @@ function buildSalutation(title, firstName, lastName) {
 
 // Pull the file ID out of any standard Google Doc URL
 function extractDocId(url) {
-  var match = url.match(/[-\w]{25,}/);
-  return match ? match[0] : null;
+  // Handles URLs like: https://docs.google.com/document/d/FILE_ID/edit
+  var match = url.match(/\/d\/([a-zA-Z0-9_-]{25,})/);
+  if (match) return match[1];
+  // Fallback: just grab any long alphanumeric string
+  var fallback = url.match(/[a-zA-Z0-9_-]{25,}/);
+  return fallback ? fallback[0] : null;
 }
 
 // Export the Google Doc as HTML using the Drive API
