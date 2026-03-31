@@ -2,8 +2,8 @@
 """
 Email Personalizer
 ==================
-Reads a draft email template and a CSV of recipients, then creates one
-personalised Gmail draft per recipient.
+Reads a draft email template and an Excel spreadsheet of recipients, then
+creates one personalised Gmail draft per recipient.
 
 Template placeholders
 ---------------------
@@ -22,7 +22,7 @@ The subject line is taken from the template (first line starting with
 
 Usage
 -----
-1. Fill in recipients.csv with title, first_name, last_name, email columns.
+1. Fill in recipients.xlsx with columns: title, first_name, last_name, email
 2. Edit template.txt with your draft.  Use {dear} where the salutation goes.
 3. Authenticate with Gmail (first run opens a browser):
        python personalizer.py
@@ -30,11 +30,10 @@ Usage
 
 Requirements
 ------------
-    pip install google-auth-oauthlib google-auth-httplib2 google-api-python-client
+    pip install openpyxl google-auth-oauthlib google-auth-httplib2 google-api-python-client
 """
 
 import base64
-import csv
 import os
 import re
 import sys
@@ -50,12 +49,29 @@ try:
 except ImportError:
     GMAIL_AVAILABLE = False
 
+# ── Gmail API imports ────────────────────────────────────────────────────────
+try:
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build
+    GMAIL_AVAILABLE = True
+except ImportError:
+    GMAIL_AVAILABLE = False
+
+# ── Excel import ─────────────────────────────────────────────────────────────
+try:
+    import openpyxl
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+
 # ── Constants ────────────────────────────────────────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/gmail.compose"]
 CREDENTIALS_FILE = "credentials.json"   # OAuth client secret downloaded from GCP
 TOKEN_FILE = "token.json"               # auto-generated after first login
 TEMPLATE_FILE = "template.txt"
-RECIPIENTS_FILE = "recipients.csv"
+RECIPIENTS_FILE = "recipients.xlsx"
 OUTPUT_DIR = "drafts_preview"           # used when Gmail is not configured
 
 
@@ -98,15 +114,40 @@ def personalise(body: str, title: str, first_name: str, last_name: str) -> str:
     return body.replace("{dear}", salutation)
 
 
-def load_recipients(csv_path: str) -> list[dict]:
-    """Load recipients from CSV.  Required columns: title, first_name, last_name, email."""
+def load_recipients(xlsx_path: str) -> list[dict]:
+    """
+    Load recipients from an Excel workbook (.xlsx).
+    Reads the first sheet.  Required columns (case-insensitive header row):
+        title, first_name, last_name, email
+    Skips rows where the email cell is empty.
+    """
+    if not OPENPYXL_AVAILABLE:
+        sys.exit("openpyxl is not installed. Run: pip install openpyxl")
+
+    wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
+    ws = wb.active
+
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        sys.exit(f"{xlsx_path} appears to be empty.")
+
+    # First row = headers (normalise to lowercase, strip whitespace)
+    headers = [str(h).strip().lower() if h is not None else "" for h in rows[0]]
+
     required = {"title", "first_name", "last_name", "email"}
-    with open(csv_path, newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh)
-        if not required.issubset(set(reader.fieldnames or [])):
-            missing = required - set(reader.fieldnames or [])
-            sys.exit(f"CSV is missing columns: {missing}")
-        return [row for row in reader if row["email"].strip()]
+    missing = required - set(headers)
+    if missing:
+        sys.exit(f"Excel sheet is missing columns: {missing}\n"
+                 f"Found headers: {headers}")
+
+    recipients = []
+    for row in rows[1:]:
+        record = dict(zip(headers, (str(v).strip() if v is not None else "" for v in row)))
+        if record.get("email"):
+            recipients.append(record)
+
+    wb.close()
+    return recipients
 
 
 # ── Gmail draft creation ─────────────────────────────────────────────────────
