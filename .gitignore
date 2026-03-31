@@ -1,5 +1,6 @@
 drafts_preview/
 token.json
 credentials.json
+.env
 __pycache__/
 *.pyc

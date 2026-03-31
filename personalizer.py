@@ -20,65 +20,73 @@ Subject
 The subject line is taken from the template (first line starting with
 "Subject:") and is identical for every draft.
 
+Authentication — three modes (tried in order)
+---------------------------------------------
+1. Gmail API   credentials.json present → uses GCP OAuth (full API)
+2. App Password  .env present with GMAIL_ADDRESS + GMAIL_APP_PASSWORD
+                 → connects via IMAP, appends to Drafts folder
+                 No GCP project needed. Requires Gmail 2-Step Verification.
+3. Preview only  neither configured → saves .txt files to drafts_preview/
+
 Usage
 -----
 1. Fill in recipients.xlsx with columns: title, first_name, last_name, email
 2. Edit template.txt with your draft.  Use {dear} where the salutation goes.
-3. Authenticate with Gmail (first run opens a browser):
-       python personalizer.py
-4. Check your Gmail Drafts folder.
+3. Add .env (App Password) or credentials.json (GCP) — see README.
+4. Run:  python personalizer.py
 
 Requirements
 ------------
-    pip install openpyxl google-auth-oauthlib google-auth-httplib2 google-api-python-client
+    pip install openpyxl python-dotenv
+    (+ google-auth-oauthlib google-auth-httplib2 google-api-python-client
+       only if using GCP / credentials.json)
 """
 
 import base64
+import email.utils
+import imaplib
 import os
 import re
 import sys
 from email.mime.text import MIMEText
 
-# ── Gmail API imports ────────────────────────────────────────────────────────
+# ── Optional: Gmail API ───────────────────────────────────────────────────────
 try:
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
-    GMAIL_AVAILABLE = True
+    GMAIL_API_AVAILABLE = True
 except ImportError:
-    GMAIL_AVAILABLE = False
+    GMAIL_API_AVAILABLE = False
 
-# ── Gmail API imports ────────────────────────────────────────────────────────
+# ── Optional: .env file support ───────────────────────────────────────────────
 try:
-    from google.auth.transport.requests import Request
-    from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from googleapiclient.discovery import build
-    GMAIL_AVAILABLE = True
+    from dotenv import load_dotenv
+    load_dotenv()
+    DOTENV_AVAILABLE = True
 except ImportError:
-    GMAIL_AVAILABLE = False
+    DOTENV_AVAILABLE = False
 
-# ── Excel import ─────────────────────────────────────────────────────────────
+# ── Optional: Excel support ───────────────────────────────────────────────────
 try:
     import openpyxl
     OPENPYXL_AVAILABLE = True
 except ImportError:
     OPENPYXL_AVAILABLE = False
 
-# ── Constants ────────────────────────────────────────────────────────────────
-SCOPES = ["https://www.googleapis.com/auth/gmail.compose"]
-CREDENTIALS_FILE = "credentials.json"   # OAuth client secret downloaded from GCP
-TOKEN_FILE = "token.json"               # auto-generated after first login
-TEMPLATE_FILE = "template.txt"
-RECIPIENTS_FILE = "recipients.xlsx"
-OUTPUT_DIR = "drafts_preview"           # used when Gmail is not configured
+# ── Constants ─────────────────────────────────────────────────────────────────
+SCOPES          = ["https://www.googleapis.com/auth/gmail.compose"]
+CREDENTIALS_FILE = "credentials.json"
+TOKEN_FILE       = "token.json"
+TEMPLATE_FILE    = "template.txt"
+RECIPIENTS_FILE  = "recipients.xlsx"
+OUTPUT_DIR       = "drafts_preview"
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def build_salutation(title: str, first_name: str, last_name: str) -> str:
-    """Return the correct salutation string for the {dear} placeholder."""
     title = title.strip()
     if title.lower() == "dr":
         return f"Dr {last_name.strip()}"
@@ -86,10 +94,6 @@ def build_salutation(title: str, first_name: str, last_name: str) -> str:
 
 
 def parse_template(template_path: str) -> tuple[str, str]:
-    """
-    Read the template file and return (subject, body_without_subject_line).
-    The subject is extracted from the first line that starts with 'Subject:'.
-    """
     with open(template_path, "r", encoding="utf-8") as fh:
         content = fh.read()
 
@@ -104,105 +108,106 @@ def parse_template(template_path: str) -> tuple[str, str]:
         else:
             body_lines.append(line)
 
-    body = "".join(body_lines).lstrip("\n")
-    return subject, body
+    return subject, "".join(body_lines).lstrip("\n")
 
 
 def personalise(body: str, title: str, first_name: str, last_name: str) -> str:
-    """Replace {dear} in the body with the correct salutation."""
-    salutation = build_salutation(title, first_name, last_name)
-    return body.replace("{dear}", salutation)
+    return body.replace("{dear}", build_salutation(title, first_name, last_name))
 
 
 def load_recipients(xlsx_path: str) -> list[dict]:
-    """
-    Load recipients from an Excel workbook (.xlsx).
-    Reads the first sheet.  Required columns (case-insensitive header row):
-        title, first_name, last_name, email
-    Skips rows where the email cell is empty.
-    """
     if not OPENPYXL_AVAILABLE:
-        sys.exit("openpyxl is not installed. Run: pip install openpyxl")
+        sys.exit("openpyxl not installed. Run: pip install openpyxl")
 
     wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
     ws = wb.active
-
     rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+
     if not rows:
-        sys.exit(f"{xlsx_path} appears to be empty.")
+        sys.exit(f"{xlsx_path} is empty.")
 
-    # First row = headers (normalise to lowercase, strip whitespace)
     headers = [str(h).strip().lower() if h is not None else "" for h in rows[0]]
-
-    required = {"title", "first_name", "last_name", "email"}
-    missing = required - set(headers)
+    missing = {"title", "first_name", "last_name", "email"} - set(headers)
     if missing:
-        sys.exit(f"Excel sheet is missing columns: {missing}\n"
-                 f"Found headers: {headers}")
+        sys.exit(f"Excel sheet is missing columns: {missing}\nFound: {headers}")
 
     recipients = []
     for row in rows[1:]:
         record = dict(zip(headers, (str(v).strip() if v is not None else "" for v in row)))
         if record.get("email"):
             recipients.append(record)
-
-    wb.close()
     return recipients
 
 
-# ── Gmail draft creation ─────────────────────────────────────────────────────
+# ── Mode 1: Gmail API (credentials.json) ─────────────────────────────────────
 
 def get_gmail_service():
-    """Authenticate and return an authorised Gmail API service object."""
     creds = None
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
-        with open(TOKEN_FILE, "w") as token:
-            token.write(creds.to_json())
-
+        with open(TOKEN_FILE, "w") as fh:
+            fh.write(creds.to_json())
     return build("gmail", "v1", credentials=creds)
 
 
-def create_gmail_draft(service, to_email: str, subject: str, body: str) -> str:
-    """Create a Gmail draft and return the draft ID."""
-    message = MIMEText(body, "plain")
-    message["to"] = to_email
-    message["subject"] = subject
-
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+def create_draft_via_api(service, to_email: str, subject: str, body: str) -> str:
+    msg = MIMEText(body, "plain")
+    msg["to"] = to_email
+    msg["subject"] = subject
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     draft = service.users().drafts().create(
-        userId="me",
-        body={"message": {"raw": raw}}
+        userId="me", body={"message": {"raw": raw}}
     ).execute()
     return draft["id"]
 
 
-# ── Local preview fallback ───────────────────────────────────────────────────
+# ── Mode 2: App Password via IMAP ─────────────────────────────────────────────
 
-def save_preview(to_email: str, subject: str, body: str, index: int):
-    """Save a personalised draft as a .txt file for review (no Gmail needed)."""
+def get_imap_connection(gmail_address: str, app_password: str) -> imaplib.IMAP4_SSL:
+    conn = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+    conn.login(gmail_address, app_password)
+    return conn
+
+
+def create_draft_via_imap(conn: imaplib.IMAP4_SSL, to_email: str,
+                           subject: str, body: str, from_email: str):
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["To"] = to_email
+    msg["From"] = from_email
+    msg["Subject"] = subject
+    msg["Date"] = email.utils.formatdate()
+
+    # Append the message to the [Gmail]/Drafts folder
+    conn.append(
+        "[Gmail]/Drafts",
+        "\\Draft",
+        imaplib.Time2Internaldate(None),
+        msg.as_bytes()
+    )
+
+
+# ── Mode 3: Local preview ─────────────────────────────────────────────────────
+
+def save_preview(to_email: str, subject: str, body: str, index: int) -> str:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    safe_name = re.sub(r"[^\w@.\-]", "_", to_email)
-    path = os.path.join(OUTPUT_DIR, f"{index:03d}_{safe_name}.txt")
+    safe = re.sub(r"[^\w@.\-]", "_", to_email)
+    path = os.path.join(OUTPUT_DIR, f"{index:03d}_{safe}.txt")
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write(f"To: {to_email}\n")
-        fh.write(f"Subject: {subject}\n")
-        fh.write("-" * 60 + "\n")
-        fh.write(body)
+        fh.write(f"To: {to_email}\nSubject: {subject}\n{'-'*60}\n{body}")
     return path
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # 1. Parse template
+    # 1. Template
     if not os.path.exists(TEMPLATE_FILE):
         sys.exit(f"Template file not found: {TEMPLATE_FILE}")
     subject, body_template = parse_template(TEMPLATE_FILE)
@@ -210,40 +215,56 @@ def main():
         sys.exit("Template must include a 'Subject:' line.")
     print(f"Subject (same for all): {subject}\n")
 
-    # 2. Load recipients
+    # 2. Recipients
     if not os.path.exists(RECIPIENTS_FILE):
         sys.exit(f"Recipients file not found: {RECIPIENTS_FILE}")
     recipients = load_recipients(RECIPIENTS_FILE)
-    print(f"Loaded {len(recipients)} recipient(s) from {RECIPIENTS_FILE}\n")
+    print(f"Loaded {len(recipients)} recipient(s)\n")
 
-    # 3. Decide mode: Gmail or local preview
-    use_gmail = GMAIL_AVAILABLE and os.path.exists(CREDENTIALS_FILE)
-    if not use_gmail:
-        if not GMAIL_AVAILABLE:
-            print("Gmail libraries not installed — saving previews to ./drafts_preview/")
-            print("Install with: pip install google-auth-oauthlib google-auth-httplib2 google-api-python-client\n")
-        else:
-            print(f"'{CREDENTIALS_FILE}' not found — saving previews to ./{OUTPUT_DIR}/")
-            print("To send to Gmail: download credentials.json from Google Cloud Console.\n")
+    # 3. Pick authentication mode
+    use_api      = GMAIL_API_AVAILABLE and os.path.exists(CREDENTIALS_FILE)
+    gmail_addr   = os.environ.get("GMAIL_ADDRESS", "").strip()
+    app_password = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
+    use_imap     = bool(gmail_addr and app_password)
 
-    service = get_gmail_service() if use_gmail else None
+    if use_api:
+        print("Mode: Gmail API (credentials.json)\n")
+        service = get_gmail_service()
+        imap_conn = None
+    elif use_imap:
+        print(f"Mode: App Password / IMAP ({gmail_addr})\n")
+        service = None
+        imap_conn = get_imap_connection(gmail_addr, app_password)
+    else:
+        print("Mode: Local preview only (no Gmail credentials found)")
+        print("  → To use App Password: create a .env file with:")
+        print("      GMAIL_ADDRESS=you@gmail.com")
+        print("      GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx\n")
+        service = None
+        imap_conn = None
 
     # 4. Process each recipient
     for i, row in enumerate(recipients, start=1):
         title      = row["title"].strip()
         first_name = row["first_name"].strip()
         last_name  = row["last_name"].strip()
-        email      = row["email"].strip()
+        to_email   = row["email"].strip()
 
-        personalised_body = personalise(body_template, title, first_name, last_name)
+        body = personalise(body_template, title, first_name, last_name)
         salutation = build_salutation(title, first_name, last_name)
 
-        if use_gmail:
-            draft_id = create_gmail_draft(service, email, subject, personalised_body)
-            print(f"[{i}] Draft created → To: {email}  |  Dear {salutation}  |  ID: {draft_id}")
+        if use_api:
+            draft_id = create_draft_via_api(service, to_email, subject, body)
+            print(f"[{i}] Draft created (API)  → {to_email}  |  Dear {salutation}  |  id:{draft_id}")
+        elif use_imap:
+            create_draft_via_imap(imap_conn, to_email, subject, body, gmail_addr)
+            print(f"[{i}] Draft created (IMAP) → {to_email}  |  Dear {salutation}")
         else:
-            path = save_preview(email, subject, personalised_body, i)
-            print(f"[{i}] Preview saved  → To: {email}  |  Dear {salutation}  |  File: {path}")
+            path = save_preview(to_email, subject, body, i)
+            print(f"[{i}] Preview saved        → {to_email}  |  Dear {salutation}  |  {path}")
+
+    if imap_conn:
+        imap_conn.logout()
 
     print(f"\nDone — {len(recipients)} draft(s) created.")
 
