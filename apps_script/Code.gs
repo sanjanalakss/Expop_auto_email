@@ -3,7 +3,6 @@
 //  Paste this entire file into Apps Script (see README for how)
 // ─────────────────────────────────────────────────────────────
 
-// Adds a custom menu when the spreadsheet opens
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("Expop Emailer")
@@ -11,36 +10,52 @@ function onOpen() {
     .addToUi();
 }
 
-// Main function — reads recipients, builds personalised drafts
 function createDrafts() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
 
-  // ── 1. Read the template ──────────────────────────────────
+  // ── 1. Read the template sheet ────────────────────────────
   var templateSheet = ss.getSheetByName("Template");
   if (!templateSheet) {
-    SpreadsheetApp.getUi().alert('Sheet named "Template" not found. Please check the tab name.');
+    SpreadsheetApp.getUi().alert('Sheet named "Template" not found.');
     return;
   }
 
   var subject = templateSheet.getRange("B1").getValue().toString().trim();
-  var body    = templateSheet.getRange("B2").getValue().toString().trim();
+  var docUrl  = templateSheet.getRange("B2").getValue().toString().trim();
 
-  if (!subject || !body) {
-    SpreadsheetApp.getUi().alert("Subject (B1) or Body (B2) is empty in the Template sheet.");
+  if (!subject) {
+    SpreadsheetApp.getUi().alert("Subject is empty — fill in cell B1 of the Template sheet.");
+    return;
+  }
+  if (!docUrl) {
+    SpreadsheetApp.getUi().alert("Doc URL is empty — paste your Google Doc URL into cell B2 of the Template sheet.");
     return;
   }
 
-  // ── 2. Read recipients ────────────────────────────────────
+  // ── 2. Fetch the Google Doc as HTML ───────────────────────
+  var docId = extractDocId(docUrl);
+  if (!docId) {
+    SpreadsheetApp.getUi().alert("Could not read the Google Doc ID from B2. Make sure you pasted the full Doc URL.");
+    return;
+  }
+
+  var htmlBody = fetchDocAsHtml(docId);
+  if (!htmlBody) {
+    SpreadsheetApp.getUi().alert("Could not fetch the Google Doc. Make sure the Doc is shared with your Google account.");
+    return;
+  }
+
+  // ── 3. Read recipients ────────────────────────────────────
   var recipientSheet = ss.getSheetByName("Recipients");
   if (!recipientSheet) {
-    SpreadsheetApp.getUi().alert('Sheet named "Recipients" not found. Please check the tab name.');
+    SpreadsheetApp.getUi().alert('Sheet named "Recipients" not found.');
     return;
   }
 
-  // Find column positions from header row (case-insensitive)
-  var headers = recipientSheet.getRange(1, 1, 1, recipientSheet.getLastColumn())
-                              .getValues()[0]
-                              .map(function(h) { return h.toString().trim().toLowerCase(); });
+  var headers = recipientSheet
+    .getRange(1, 1, 1, recipientSheet.getLastColumn())
+    .getValues()[0]
+    .map(function(h) { return h.toString().trim().toLowerCase(); });
 
   var colTitle     = headers.indexOf("title");
   var colFirstName = headers.indexOf("first_name");
@@ -57,13 +72,15 @@ function createDrafts() {
 
   var lastRow = recipientSheet.getLastRow();
   if (lastRow < 2) {
-    SpreadsheetApp.getUi().alert("No recipients found (sheet has no data rows).");
+    SpreadsheetApp.getUi().alert("No recipients found in the Recipients sheet.");
     return;
   }
 
-  var data = recipientSheet.getRange(2, 1, lastRow - 1, recipientSheet.getLastColumn()).getValues();
+  var data = recipientSheet
+    .getRange(2, 1, lastRow - 1, recipientSheet.getLastColumn())
+    .getValues();
 
-  // ── 3. Create one draft per recipient ─────────────────────
+  // ── 4. Create one draft per recipient ─────────────────────
   var created = 0;
   var skipped = 0;
 
@@ -76,27 +93,52 @@ function createDrafts() {
 
     if (!email) { skipped++; continue; }
 
-    var salutation = buildSalutation(title, firstName, lastName);
-    var personalBody = body.replace(/{dear}/g, salutation);
+    var salutation       = buildSalutation(title, firstName, lastName);
+    var personalHtmlBody = htmlBody.replace(/{dear}/g, salutation);
+    var personalPlain    = "Dear " + salutation + ",\n\n(Open in Gmail to view formatted email)";
 
-    GmailApp.createDraft(email, subject, personalBody);
+    GmailApp.createDraft(email, subject, personalPlain, { htmlBody: personalHtmlBody });
     created++;
   }
 
   SpreadsheetApp.getUi().alert(
-    "Done!\n" +
-    created + " draft(s) created in your Gmail Drafts folder." +
-    (skipped > 0 ? "\n" + skipped + " row(s) skipped (no email address)." : "")
+    "Done!\n" + created + " draft(s) created in your Gmail Drafts folder." +
+    (skipped > 0 ? "\n" + skipped + " row(s) skipped (no email)." : "")
   );
 }
 
-// Salutation rules:
-//   Dr  → Dr {last_name}
-//   Mr  → Mr {first_name}
-//   Ms  → Ms {first_name}
+// ── Helpers ───────────────────────────────────────────────────
+
 function buildSalutation(title, firstName, lastName) {
   if (title.toLowerCase() === "dr") {
     return "Dr " + lastName;
   }
   return title + " " + firstName;
+}
+
+// Pull the file ID out of any standard Google Doc URL
+function extractDocId(url) {
+  var match = url.match(/[-\w]{25,}/);
+  return match ? match[0] : null;
+}
+
+// Export the Google Doc as HTML using the Drive API
+function fetchDocAsHtml(docId) {
+  try {
+    var exportUrl = "https://docs.google.com/feeds/download/documents/export/Export?id=" +
+                    docId + "&exportFormat=html";
+    var response = UrlFetchApp.fetch(exportUrl, {
+      headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
+      muteHttpExceptions: true
+    });
+    if (response.getResponseCode() !== 200) return null;
+
+    var fullHtml = response.getContentText();
+
+    // Strip the outer <html><head>...</head><body> wrapper — keep just the body content
+    var bodyMatch = fullHtml.match(/<body[^>]*>([\s\S]*)<\/body>/i);
+    return bodyMatch ? bodyMatch[1].trim() : fullHtml;
+  } catch (e) {
+    return null;
+  }
 }
