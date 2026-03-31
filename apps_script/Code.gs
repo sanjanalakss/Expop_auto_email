@@ -32,16 +32,18 @@ function createDrafts() {
     return;
   }
 
-  // ── 2. Fetch the Google Doc as HTML ───────────────────────
+  // ── 2. Open the Google Doc and convert to HTML ────────────
   var docId = extractDocId(docUrl);
   if (!docId) {
     SpreadsheetApp.getUi().alert("Could not read the Google Doc ID from B2. Make sure you pasted the full Doc URL.");
     return;
   }
 
-  var htmlBody = fetchDocAsHtml(docId);
-  if (!htmlBody) {
-    SpreadsheetApp.getUi().alert("Could not fetch the Google Doc. Make sure the Doc is shared with your Google account.");
+  var htmlBody;
+  try {
+    htmlBody = docToHtml(docId);
+  } catch (e) {
+    SpreadsheetApp.getUi().alert("Could not open the Google Doc.\n\nError: " + e.message);
     return;
   }
 
@@ -116,33 +118,107 @@ function buildSalutation(title, firstName, lastName) {
   return title + " " + firstName;
 }
 
-// Pull the file ID out of any standard Google Doc URL
 function extractDocId(url) {
-  // Handles URLs like: https://docs.google.com/document/d/FILE_ID/edit
   var match = url.match(/\/d\/([a-zA-Z0-9_-]{25,})/);
   if (match) return match[1];
-  // Fallback: just grab any long alphanumeric string
   var fallback = url.match(/[a-zA-Z0-9_-]{25,}/);
   return fallback ? fallback[0] : null;
 }
 
-// Export the Google Doc as HTML using the Drive API
-function fetchDocAsHtml(docId) {
-  try {
-    var exportUrl = "https://docs.google.com/feeds/download/documents/export/Export?id=" +
-                    docId + "&exportFormat=html";
-    var response = UrlFetchApp.fetch(exportUrl, {
-      headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
-      muteHttpExceptions: true
-    });
-    if (response.getResponseCode() !== 200) return null;
+// ── Google Doc → HTML conversion ──────────────────────────────
+// Uses DocumentApp (always accessible, no extra permissions needed)
 
-    var fullHtml = response.getContentText();
+function docToHtml(docId) {
+  var doc  = DocumentApp.openById(docId);
+  var body = doc.getBody();
+  var n    = body.getNumChildren();
+  var html = '';
+  var inList = false;
+  var listTag = '';
 
-    // Strip the outer <html><head>...</head><body> wrapper — keep just the body content
-    var bodyMatch = fullHtml.match(/<body[^>]*>([\s\S]*)<\/body>/i);
-    return bodyMatch ? bodyMatch[1].trim() : fullHtml;
-  } catch (e) {
-    return null;
+  for (var i = 0; i < n; i++) {
+    var child = body.getChild(i);
+    var type  = child.getType();
+
+    if (type === DocumentApp.ElementType.LIST_ITEM) {
+      var li       = child.asListItem();
+      var glyph    = li.getGlyphType();
+      var ordered  = (glyph === DocumentApp.GlyphType.DECIMAL ||
+                      glyph === DocumentApp.GlyphType.LATIN_UPPER ||
+                      glyph === DocumentApp.GlyphType.LATIN_LOWER ||
+                      glyph === DocumentApp.GlyphType.ROMAN_UPPER ||
+                      glyph === DocumentApp.GlyphType.ROMAN_LOWER);
+      var tag = ordered ? 'ol' : 'ul';
+
+      if (!inList) {
+        html   += '<' + tag + '>';
+        inList  = true;
+        listTag = tag;
+      } else if (tag !== listTag) {
+        html   += '</' + listTag + '><' + tag + '>';
+        listTag = tag;
+      }
+      html += '<li>' + elementToHtml(li) + '</li>';
+
+    } else {
+      if (inList) {
+        html   += '</' + listTag + '>';
+        inList  = false;
+        listTag = '';
+      }
+
+      if (type === DocumentApp.ElementType.PARAGRAPH) {
+        var para    = child.asParagraph();
+        var heading = para.getHeading();
+        var inner   = elementToHtml(para);
+
+        if      (heading === DocumentApp.ParagraphHeading.HEADING1) html += '<h1>' + inner + '</h1>';
+        else if (heading === DocumentApp.ParagraphHeading.HEADING2) html += '<h2>' + inner + '</h2>';
+        else if (heading === DocumentApp.ParagraphHeading.HEADING3) html += '<h3>' + inner + '</h3>';
+        else if (inner.trim() === '')                               html += '<br>';
+        else                                                         html += '<p>' + inner + '</p>';
+      }
+    }
   }
+
+  if (inList) html += '</' + listTag + '>';
+  return html;
+}
+
+function elementToHtml(element) {
+  var html = '';
+  for (var i = 0; i < element.getNumChildren(); i++) {
+    var child = element.getChild(i);
+    if (child.getType() === DocumentApp.ElementType.TEXT) {
+      html += textToHtml(child.asText());
+    }
+  }
+  return html;
+}
+
+function textToHtml(textEl) {
+  var raw     = textEl.getText();
+  if (!raw) return '';
+
+  var indices = textEl.getTextAttributeIndices();
+  if (indices.length === 0) indices = [0];
+  indices.push(raw.length);
+
+  var result = '';
+  for (var i = 0; i < indices.length - 1; i++) {
+    var start = indices[i];
+    var end   = indices[i + 1];
+    var chunk = raw.substring(start, end);
+    if (!chunk) continue;
+
+    // Escape HTML special characters
+    chunk = chunk.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    if (textEl.isUnderline(start)) chunk = '<u>'  + chunk + '</u>';
+    if (textEl.isItalic(start))    chunk = '<i>'  + chunk + '</i>';
+    if (textEl.isBold(start))      chunk = '<b>'  + chunk + '</b>';
+
+    result += chunk;
+  }
+  return result;
 }
